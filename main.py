@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
-from matchers import match_blobs_sumassign
+from matchers import match_blobs_sumassign, match_blobs_ransac
 from blobwatch import BlobWatch
 from helperutils import load_intrinsics, load_extrinsics
 from constutils import triangulate_dlt
@@ -10,29 +10,28 @@ fig = plt.figure()
 ax = fig.add_subplot(111, projection='3d')
 sc = ax.scatter([], [], [], c='red', s=20)
 plt.ion()
-ax.set_xlim(-5, 5)
-ax.set_ylim(-0, 5)
-ax.set_zlim(-5, 5)
+ax.set_xlim(-1, 1)
+ax.set_ylim(-0, 1)
+ax.set_zlim(-1, 1)
 frame_width = 2560
 frame_height = 720
 split_width = 1280    
 
 
-
 def main_demo():
     #init camera
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    cap = cv2.VideoCapture(2, cv2.CAP_DSHOW)
 
     #camera settings 
-    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
-    cap.set(cv2.CAP_PROP_EXPOSURE, 5)
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0)
+    cap.set(cv2.CAP_PROP_EXPOSURE, -6)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, frame_width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, frame_height)
 
 
     #init blob find/track
-    bwL = BlobWatch(pixel_threshold=100, min_area=5, max_area=500)
-    bwR = BlobWatch(pixel_threshold=100, min_area=5, max_area=500)
+    bwL = BlobWatch(pixel_threshold=240, min_area=50, max_area=3000, pyramid_scales = [1.5, 1.0, 0.5])
+    bwR = BlobWatch(pixel_threshold=240, min_area=50, max_area=3000, pyramid_scales = [1.5, 1.0, 0.5])
 
 
     #load camera parameters from calibration
@@ -64,10 +63,12 @@ def main_demo():
         observationL = bwL.process_frame(grayL)
         observationR = bwR.process_frame(grayR)
 
-        matches, unmatched_left, unmatched_right = match_blobs_sumassign(
+        matches, unmatched_left, unmatched_right = match_blobs_ransac(
             observationL.blobs,
             observationR.blobs,
-            max_match_distance=500
+            ransac_threshold = 0.1,
+            max_match_distance=500,
+            size_threshold = 0.5, 
         )
         combined = np.hstack((left_img.copy(), right_img.copy()))
 
@@ -119,6 +120,7 @@ def main_demo():
             Rt1 = np.hstack([R1, T1_meters])
             P1 = K1 @ Rt1
             X, Y, Z = triangulate_dlt(P0, P1, x0, x1)
+            print(left_blob.vx)
             dim3_points.append((X, Y, Z))
 
         # This gets the points into the 3d visualazer
@@ -127,9 +129,9 @@ def main_demo():
             sc._offsets3d = (dim3_points[:, 0],
                              dim3_points[:, 2],
                              -dim3_points[:, 1])
-            
-
-        view_resize = 2 
+        if len(dim3_points) > 1:
+            print(abs(dim3_points[0][2]-dim3_points[1][2]))
+        view_resize = 2
         combined = cv2.resize(combined, (int(combined.shape[1] / view_resize), int(combined.shape[0] / view_resize)))
         cv2.imshow("Blob Matches", combined)
         plt.draw()
