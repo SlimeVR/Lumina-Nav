@@ -38,10 +38,6 @@ def _fast_norm_squared(a, b):
 
 @njit
 def _fast_score_correspondences(proj_points, centers_px, radii, facing_mask):
-    """
-    Fast correspondence scoring using Numba JIT compilation.
-    Returns: (inliers_count, squared_error_sum, correspondences_led_indices, correspondences_det_indices)
-    """
     N = proj_points.shape[0]
     M = centers_px.shape[0]
     
@@ -49,7 +45,7 @@ def _fast_score_correspondences(proj_points, centers_px, radii, facing_mask):
     inliers = 0
     sqerr = 0.0
     
-    # Pre-allocate arrays for correspondences
+    #pre-allocate arrays for correspondences
     led_indices = np.full(N, -1, dtype=np.int32)
     det_indices = np.full(N, -1, dtype=np.int32)
     correspondence_count = 0
@@ -58,7 +54,7 @@ def _fast_score_correspondences(proj_points, centers_px, radii, facing_mask):
         if not facing_mask[i]:
             continue
             
-        # Find nearest unused blob
+        #find nearest unused blob
         best_distance_sq = np.inf
         best_blob_idx = -1
         
@@ -77,7 +73,7 @@ def _fast_score_correspondences(proj_points, centers_px, radii, facing_mask):
                 inliers += 1
                 sqerr += best_distance_sq
                 
-                # Store correspondence
+                #store correspondence
                 led_indices[correspondence_count] = i
                 det_indices[correspondence_count] = best_blob_idx
                 correspondence_count += 1
@@ -86,7 +82,6 @@ def _fast_score_correspondences(proj_points, centers_px, radii, facing_mask):
 
 @njit
 def _fast_compute_scale_ratios(X, led_corr_items, centers_px, distance_to_target, focal_length, max_pairs=10):
-    """Compute scale ratios for geometric validation"""
     scale_ratios = np.zeros(max_pairs, dtype=np.float64)
     ratio_count = 0
     
@@ -109,15 +104,15 @@ def _fast_compute_scale_ratios(X, led_corr_items, centers_px, distance_to_target
             dz = X[led1_idx, 2] - X[led2_idx, 2]
             world_dist = np.sqrt(dx*dx + dy*dy + dz*dz)
             
-            if world_dist < 15.0:  # Skip very close LED pairs
+            if world_dist < 15.0:  #skip very close LED pairs
                 continue
             
-            # 2D distance between detections
+            #2D distance between detections
             px_dx = centers_px[det1_idx, 0] - centers_px[det2_idx, 0]
             px_dy = centers_px[det1_idx, 1] - centers_px[det2_idx, 1]
             pixel_dist = np.sqrt(px_dx*px_dx + px_dy*px_dy)
             
-            # Expected pixel distance
+            #expected pixel distance
             expected_pixel_dist = (world_dist * focal_length) / distance_to_target
             
             if expected_pixel_dist > 1.0:
@@ -228,16 +223,15 @@ class SolvePoseBruteOptimized:
 
     def _estimate_adaptive_radius(self, inner_sizes: np.ndarray, expected_distance: Optional[float] = None) -> np.ndarray:
         if self.distance_adaptive and expected_distance is not None:
-            # Estimate pixel size of LEDs at this distance
+            #estimate pixel size of LEDs at this distance
             expected_pixel_size = (self.avg_led_spacing * self.fx) / expected_distance
             
-            # Set tolerance based on expected size with margin
+            #set tolerance based on expected size with margin
             adaptive_radius = min(50.0, max(10.0, expected_pixel_size * 2.5))
             radii = np.full(len(inner_sizes), adaptive_radius, dtype=np.float64)
         else:
-            # Use blob sizes as guide with minimum threshold
             radii = np.maximum(inner_sizes * 2.0, 15.0)
-            radii = np.minimum(radii, 50.0)  # Cap at 50 pixels
+            radii = np.minimum(radii, 50.0)  #cap at 50 pixels
         
         return radii
 
@@ -247,7 +241,6 @@ class SolvePoseBruteOptimized:
         radii: np.ndarray,
         max_movement: float = 100.0
     ) -> Optional[Tuple[np.ndarray, np.ndarray, Dict]]:
-        """Try to refine previous pose for temporal consistency"""
         if not self.use_temporal or self._last_rvec is None or self._last_tvec is None:
             return None
             
