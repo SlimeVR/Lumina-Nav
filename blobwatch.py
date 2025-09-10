@@ -1,308 +1,462 @@
-import cv2
 import numpy as np
-import logging
-from collections import deque
-from math import sqrt
+from numba import jit, njit, types, typed
+from numba.typed import List
+from dataclasses import dataclass
+import cv2
+from typing import Optional, Tuple
 
-logging.basicConfig(level=logging.DEBUG)
+NUM_FRAMES_HISTORY = 5
+MAX_EXTENTS_PER_LINE = 30
+QUEUE_ENTRIES = NUM_FRAMES_HISTORY + 1
+MAX_BLOBS_PER_FRAME = 100
+LED_INVALID_ID = 0xFFFF
 
-class Blob:
-    def __init__(self, blob_id, x, y, area, top, left, width, height):
-        self.blob_id = blob_id
-        self.x = x
-        self.y = y
-        self.area = area
-        self.top = top
-        self.left = left
-        self.width = width
-        self.height = height
-        self.vx = 0.0
-        self.vy = 0.0
-        self.age = 0
-        self.led_id = -1
-        self.prev_led_id = -1
-        self.track_index = -1
+extent_dtype = np.dtype([
+    ('start', np.uint16),
+    ('end', np.uint16),
+    ('top', np.uint16),
+    ('left', np.uint16),
+    ('right', np.uint16),
+    ('area', np.uint32),
+    ('max_pixel', np.uint8)
+])
 
-    def __repr__(self):
-        return (f"Blob(ID={self.blob_id}, x={self.x:.2f}, y={self.y:.2f}, "
-                f"area={self.area}, vx={self.vx:.2f}, vy={self.vy:.2f}, "
-                f"age={self.age}, track_index={self.track_index})")
+blob_dtype = np.dtype([
+    ('blob_id', np.uint32),
+    ('x', np.float32),
+    ('y', np.float32),
+    ('vx', np.float32),
+    ('vy', np.float32),
+    ('left', np.uint16),
+    ('top', np.uint16),
+    ('width', np.uint16),
+    ('height', np.uint16),
+    ('area', np.uint32),
+    ('age', np.uint16),
+    ('track_index', np.int16),
+    ('id_age', np.uint16),
+    ('prev_led_id', np.uint16),
+    ('led_id', np.uint16),
+    ('brightness', np.uint8)
+])
 
-class BlobObservation:
+@njit
+def min_val(x, y):
+    return x if x < y else y
+
+@njit
+def max_val(x, y):
+    return x if x > y else y
+
+@njit
+def abs_val(x):
+    return x if x >= 0 else -x
+
+class ExtentLine:
     def __init__(self):
-        self.blobs = []
+        self.extents = np.zeros(MAX_EXTENTS_PER_LINE, dtype=extent_dtype)
+        self.num = 0
+
+class Blobservation:
+    def __init__(self):
+        self.blobs = np.zeros(MAX_BLOBS_PER_FRAME, dtype=blob_dtype)
         self.num_blobs = 0
+        self.tracked = np.zeros(MAX_BLOBS_PER_FRAME, dtype=np.uint8)
         self.dropped_dark_blobs = 0
 
-class BlobWatch:
-    def __init__(self, 
-                 pixel_threshold=50, 
-                 min_area=5, 
-                 max_area=1e5, 
-                 history_length=100,
-                 pyramid_scales=None,
-                 max_merge_distance=10.0):
-        """
-        :param pixel_threshold: Threshold for binarizing the image
-        :param min_area: Minimum area for a valid blob
-        :param max_area: Maximum area for a valid blob
-        :param history_length: Number of previous observations to buffer
-        :param pyramid_scales: List of downscale factors for the pyramid 
-                               (e.g. [1.0, 0.5, 0.25]). 1.0 means original size.
-        :param max_merge_distance: Distance threshold for merging duplicate 
-                                   blob detections across scales
-        """
-        self.pixel_threshold = pixel_threshold
-        self.min_area = min_area
-        self.max_area = max_area
-        self.max_match_distance = 50.0
-        self.next_blob_id = 0
-        self.next_track_index = 0
-        self.buffer_capacity = history_length + 1
-        self.observation_buffer = deque()
-        for _ in range(history_length):
-            self.observation_buffer.append(BlobObservation())
-        self.previous_observation = None
-        
-        self.pyramid_scales = pyramid_scales if pyramid_scales else [1.0, 0.5]
-        self.max_merge_distance = max_merge_distance
-
-    def process_frame(self, frame):
-
-        pyramid_frames = []
-        for scale in self.pyramid_scales:
-            if scale == 1.0:
-                scaled_frame = frame
-            else:
-                new_w = int(frame.shape[1] * scale)
-                new_h = int(frame.shape[0] * scale)
-                scaled_frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-            pyramid_frames.append((scale, scaled_frame))
-
-        all_blobs = []
-        for scale, sframe in pyramid_frames:
-            scale_blobs = self._detect_blobs_in_frame(sframe, scale)
-            all_blobs.extend(scale_blobs)
-
-        merged_blobs = self._merge_candidate_blobs(all_blobs, self.max_merge_distance)
-
-        if self.observation_buffer:
-            observation = self.observation_buffer.popleft()
-            observation.blobs.clear()
-            observation.num_blobs = 0
-            observation.dropped_dark_blobs = 0
-        else:
-            observation = BlobObservation()
-
-        observation.blobs = merged_blobs
-        observation.num_blobs = len(merged_blobs)
-
-        self._match_and_update_ids(observation)
-
-        self.previous_observation = observation
-
+class BlobservationQueue:
+    def __init__(self, observations):
+        self.data = [None] * QUEUE_ENTRIES
+        self.head = 0
+        self.tail = 0
+        #initialize with observations
+        for obs in observations:
+            self.push(obs)
+    
+    def push(self, observation):
+        next_tail = (self.tail + 1) % QUEUE_ENTRIES
+        assert next_tail != self.head, "Queue full"
+        self.data[self.tail] = observation
+        self.tail = next_tail
+    
+    def pop(self):
+        if self.tail == self.head:
+            return None
+        observation = self.data[self.head]
+        self.head = (self.head + 1) % QUEUE_ENTRIES
         return observation
 
-    def _detect_blobs_in_frame(self, frame, scale=1.0):
-        """
-        Runs threshold + morphological ops + connectedComponents
-        on the given (scaled) frame, returning a list of Blob objects
-        whose coordinates are converted back to the original scale.
-        """
+class Blobwatch:
+    def __init__(self, pixel_threshold=10, blob_required_threshold=20):
+        self.next_blob_id = 1
+        self.pixel_threshold = pixel_threshold
+        self.blob_required_threshold = blob_required_threshold
+        self.blob_max_wh = 35
+        self.debug = True
+        
+        self.observations = [Blobservation() for _ in range(NUM_FRAMES_HISTORY)]
+        self.observation_q = BlobservationQueue(self.observations)
+        self.last_observation = None
 
-        if len(frame.shape) == 3 and frame.shape[2] == 3:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+@njit
+def compute_greysum(frame: np.ndarray, extent: np.ndarray, end_y: int) -> Tuple[float, float]:
+    left = extent['left']
+    right = extent['right']
+    top = extent['top']
+    
+    width = right - left + 1
+    height = end_y - top + 1
+    
+    greysum_total = 0
+    greysum_x = 0
+    greysum_y = 0
+    
+    for y in range(height):
+        y_pos = top + y + 1
+        x_pos = left + 1
+        
+        for x in range(width):
+            pix = frame[top + y, left + x]
+            greysum_total += pix
+            greysum_x += x_pos * pix
+            greysum_y += y_pos * pix
+            x_pos += 1
+    
+    if greysum_total > 0:
+        led_x = float(greysum_x) / greysum_total - 1
+        led_y = float(greysum_y) / greysum_total - 1
+    else:
+        led_x = float(left + right) / 2
+        led_y = float(top + end_y) / 2
+    
+    return led_x, led_y
+
+@njit
+def store_blob(extent: np.ndarray, index: int, end_y: int, blobs: np.ndarray,
+               blob_id: int, led_x: float, led_y: float, brightness: int):
+    b = blobs[index]
+    b['blob_id'] = blob_id
+    b['x'] = led_x
+    b['y'] = led_y
+    b['vx'] = 0
+    b['vy'] = 0
+    b['left'] = extent['left']
+    b['top'] = extent['top']
+    b['width'] = extent['right'] - extent['left'] + 1
+    b['height'] = end_y - extent['top'] + 1
+    b['area'] = extent['area']
+    b['age'] = 0
+    b['track_index'] = -1
+    b['id_age'] = 0
+    b['prev_led_id'] = LED_INVALID_ID
+    b['led_id'] = LED_INVALID_ID
+    b['brightness'] = brightness
+
+def extent_to_blobs(bw: Blobwatch, ob: Blobservation, extent: np.ndarray, 
+                    y: int, frame: np.ndarray):
+    
+    if extent['max_pixel'] < bw.blob_required_threshold:
+        ob.dropped_dark_blobs += 1
+        return
+    
+    if extent['top'] == y and extent['left'] == extent['right']:
+        return
+    
+    if y - extent['top'] > bw.blob_max_wh or extent['right'] - extent['left'] > bw.blob_max_wh:
+        return
+    
+    if ob.num_blobs < MAX_BLOBS_PER_FRAME:
+        led_x, led_y = compute_greysum(frame, extent, y)
+        store_blob(extent, ob.num_blobs, y, ob.blobs, 
+                  bw.next_blob_id, led_x, led_y, extent['max_pixel'])
+        bw.next_blob_id += 1
+        ob.num_blobs += 1
+
+@njit
+def process_scanline_core(line: np.ndarray, pixel_threshold: int, y: int,
+                          el_extents: np.ndarray, el_num: int,
+                          prev_el_extents: np.ndarray, prev_el_num: int) -> Tuple[np.ndarray, int, np.ndarray]:
+    """Core scanline processing with Numba optimization"""
+    
+    width = len(line)
+    finished_extents = np.zeros(MAX_EXTENTS_PER_LINE, dtype=extent_dtype)
+    num_finished = 0
+    
+    le_idx = 0 
+    e = 0
+    
+    x = 0
+    while x < width and e < MAX_EXTENTS_PER_LINE:
+        if line[x] <= pixel_threshold:
+            x += 1
+            continue
+        
+        start = x
+        max_pixel = line[x]
+        x += 1
+        
+        while x < width and line[x] > pixel_threshold:
+            if line[x] > max_pixel:
+                max_pixel = line[x]
+            x += 1
+        
+        end = x - 1
+        center = (start + end) / 2.0
+        
+        extent = el_extents[e]
+        extent['start'] = start
+        extent['end'] = end
+        extent['area'] = x - start
+        extent['max_pixel'] = max_pixel
+        
+        is_new_extent = True
+        
+        if prev_el_num > 0:
+            while le_idx < prev_el_num and prev_el_extents[le_idx]['end'] < center:
+                finished_extents[num_finished] = prev_el_extents[le_idx]
+                num_finished += 1
+                le_idx += 1
+            
+            if le_idx < prev_el_num:
+                le = prev_el_extents[le_idx]
+                if le['start'] <= center and le['end'] >= center:
+                    extent['top'] = le['top']
+                    extent['left'] = min_val(extent['start'], le['left'])
+                    extent['right'] = max_val(extent['end'], le['right'])
+                    if le['max_pixel'] > extent['max_pixel']:
+                        extent['max_pixel'] = le['max_pixel']
+                    extent['area'] += le['area']
+                    is_new_extent = False
+                    le_idx += 1
+        
+        if is_new_extent:
+            extent['top'] = y
+            extent['left'] = extent['start']
+            extent['right'] = extent['end']
+        
+        e += 1
+    
+    while le_idx < prev_el_num:
+        finished_extents[num_finished] = prev_el_extents[le_idx]
+        num_finished += 1
+        le_idx += 1
+    
+    return el_extents, e, finished_extents[:num_finished]
+
+def process_scanline(line: np.ndarray, bw: Blobwatch, y: int, 
+                    el: ExtentLine, prev_el: Optional[ExtentLine],
+                    frame: np.ndarray, ob: Blobservation):
+    """Process a single scanline to find extents"""
+    
+    prev_extents = prev_el.extents if prev_el else np.zeros(0, dtype=extent_dtype)
+    prev_num = prev_el.num if prev_el else 0
+    
+    _, el.num, finished_extents = process_scanline_core(
+        line, bw.pixel_threshold, y, el.extents, el.num,
+        prev_extents, prev_num
+    )
+    
+    for extent in finished_extents:
+        extent_to_blobs(bw, ob, extent, y, frame)
+    
+    if y == frame.shape[0] - 1:
+        for i in range(el.num):
+            extent_to_blobs(bw, ob, el.extents[i], y, frame)
+
+def process_frame(bw: Blobwatch, ob: Blobservation, frame: np.ndarray):
+    ob.num_blobs = 0
+    ob.dropped_dark_blobs = 0
+    
+    el1 = ExtentLine()
+    el2 = ExtentLine()
+    
+    process_scanline(frame[0], bw, 0, el1, None, frame, ob)
+    
+    for y in range(1, frame.shape[0]):
+        if y & 1:
+            process_scanline(frame[y], bw, y, el2, el1, frame, ob)
         else:
-            gray = frame
+            process_scanline(frame[y], bw, y, el1, el2, frame, ob)
 
-        # Threshold
-        _, binary = cv2.threshold(gray, self.pixel_threshold, 255, cv2.THRESH_BINARY)
+@njit
+def find_free_track(tracked: np.ndarray) -> int:
+    for i in range(len(tracked)):
+        if tracked[i] == 0:
+            return i
+    return -1
 
-        kernel = np.ones((3, 3), np.uint8)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+@njit
+def copy_matching_blob(to_blob: np.ndarray, from_blob: np.ndarray):
+    to_blob['blob_id'] = from_blob['blob_id']
+    to_blob['vx'] = to_blob['x'] - from_blob['x']
+    to_blob['vy'] = to_blob['y'] - from_blob['y']
+    to_blob['id_age'] = from_blob['id_age']
+    to_blob['led_id'] = from_blob['led_id']
+    to_blob['age'] = from_blob['age'] + 1
 
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
-
-        detected_blobs = []
-        for label_id in range(1, num_labels):
-            area = stats[label_id, cv2.CC_STAT_AREA]
-            # Filter by area at the scaled level
-            if area < self.min_area or area > self.max_area:
-                continue
-
-            left = stats[label_id, cv2.CC_STAT_LEFT]
-            top = stats[label_id, cv2.CC_STAT_TOP]
-            width = stats[label_id, cv2.CC_STAT_WIDTH]
-            height = stats[label_id, cv2.CC_STAT_HEIGHT]
-
-            cx, cy = centroids[label_id]
-            if scale != 1.0:
-                cx_orig = cx / scale
-                cy_orig = cy / scale
-                left_orig = left / scale
-                top_orig = top / scale
-                width_orig = width / scale
-                height_orig = height / scale
-            else:
-                cx_orig = cx
-                cy_orig = cy
-                left_orig = float(left)
-                top_orig = float(top)
-                width_orig = float(width)
-                height_orig = float(height)
-
-            blob = Blob(blob_id=-1,
-                        x=cx_orig,
-                        y=cy_orig,
-                        area=area,  
-                        top=int(top_orig),
-                        left=int(left_orig),
-                        width=int(width_orig),
-                        height=int(height_orig))
-            detected_blobs.append(blob)
-
-        return detected_blobs
-
-    def _merge_candidate_blobs(self, blobs, merge_distance):
-        merged = []
-        visited = [False] * len(blobs)
-
-        for i in range(len(blobs)):
-            if visited[i]:
-                continue
-
-            cluster_indices = [i]
-            queue = [i]
-            visited[i] = True
-
-            while queue:
-                current_idx = queue.pop(0)
-                for j in range(len(blobs)):
-                    if not visited[j]:
-                        if self._blob_distance(blobs[current_idx], blobs[j]) < merge_distance:
-                            visited[j] = True
-                            queue.append(j)
-                            cluster_indices.append(j)
-
-            cluster_blobs = [blobs[idx] for idx in cluster_indices]
-            merged_blob = self._combine_blob_cluster(cluster_blobs)
-            merged.append(merged_blob)
-
-        return merged
-
-    def _blob_distance(self, b1, b2):
-
-        dx = b1.x - b2.x
-        dy = b1.y - b2.y
-        return sqrt(dx*dx + dy*dy)
-
-    def _combine_blob_cluster(self, cluster_blobs):
-
-        if not cluster_blobs:
-            return None
-        if len(cluster_blobs) == 1:
-            return cluster_blobs[0]
-
-        total_area = sum(b.area for b in cluster_blobs)
-        if total_area < 1e-6:
-            total_area = len(cluster_blobs)
-
-        x_sum = 0.0
-        y_sum = 0.0
-        for b in cluster_blobs:
-            x_sum += b.x * b.area
-            y_sum += b.y * b.area
-
-        avg_x = x_sum / total_area
-        avg_y = y_sum / total_area
-
-        lefts   = [b.left for b in cluster_blobs]
-        tops    = [b.top for b in cluster_blobs]
-        rights  = [b.left + b.width for b in cluster_blobs]
-        bottoms = [b.top + b.height for b in cluster_blobs]
-
-        union_left   = min(lefts)
-        union_top    = min(tops)
-        union_right  = max(rights)
-        union_bottom = max(bottoms)
-
-        new_blob = Blob(
-            blob_id=-1, 
-            x=avg_x,
-            y=avg_y,
-            area=int(sum(b.area for b in cluster_blobs)),
-            top=union_top,
-            left=union_left,
-            width=union_right - union_left,
-            height=union_bottom - union_top,
-        )
-        return new_blob
-
-    def _match_and_update_ids(self, observation):
-        """
-        Matches newly detected blobs with old ones based on proximity
-        to predicted positions (x+vx, y+vy). If a match is found
-        within self.max_match_distance, we reuse the old ID; otherwise
-        we assign a new ID.
-        """
-        new_blobs = observation.blobs
-        old_ob = self.previous_observation
-        if old_ob is None:
-            for blob in new_blobs:
-                blob.blob_id = self.next_blob_id
-                self.next_blob_id += 1
-                blob.track_index = self.next_track_index
-                self.next_track_index += 1
-            return
-
-        old_blobs = old_ob.blobs
-        predicted = [(old.x + old.vx, old.y + old.vy) for old in old_blobs]
-        distances = {}
-
-        for i, new_blob in enumerate(new_blobs):
-            for j, (pred_x, pred_y) in enumerate(predicted):
-                dx = new_blob.x - pred_x
-                dy = new_blob.y - pred_y
-                dist = (dx*dx + dy*dy) ** 0.5
-                if dist < self.max_match_distance:
-                    distances[(i, j)] = dist
-
-        new_matches = [-1] * len(new_blobs)
-        old_matches = [-1] * len(old_blobs)
-
-        for (i, j), dist in sorted(distances.items(), key=lambda item: item[1]):
-            if new_matches[i] == -1 and old_matches[j] == -1:
-                new_matches[i] = j
-                old_matches[j] = i
-
-        for i, new_blob in enumerate(new_blobs):
-            if new_matches[i] != -1:
-                old_blob = old_blobs[new_matches[i]]
-                new_blob.blob_id = old_blob.blob_id
-                new_blob.vx = new_blob.x - old_blob.x
-                new_blob.vy = new_blob.y - old_blob.y
-                new_blob.age = old_blob.age + 1
-                new_blob.track_index = old_blob.track_index
-            else:
-                new_blob.blob_id = self.next_blob_id
-                self.next_blob_id += 1
-                new_blob.track_index = self.next_track_index
-                self.next_track_index += 1
-
-    def find_blob_at(self, x, y, tolerance=5.0):
-        """
-        Find a blob in the last observation near (x,y) within 'tolerance'
-        """
-        if self.previous_observation is None:
-            return None
-        for blob in self.previous_observation.blobs:
-            dx = blob.x - x
-            dy = blob.y - y
-            if (dx*dx + dy*dy) ** 0.5 <= tolerance:
-                return blob
+def blobwatch_process(bw: Blobwatch, frame: np.ndarray) -> Optional[Blobservation]:
+    
+    ob = bw.observation_q.pop()
+    if ob is None:
         return None
+    
+    process_frame(bw, ob, frame)
+    
+    if bw.last_observation is None:
+        bw.last_observation = ob
+        return ob
+    
+    last_ob = bw.last_observation
+    
+    closest_ob = np.full(MAX_BLOBS_PER_FRAME, -1, dtype=np.int32)
+    closest_last_ob = np.full(MAX_BLOBS_PER_FRAME, -1, dtype=np.int32)
+    closest_last_ob_distsq = np.full(MAX_BLOBS_PER_FRAME, 1000000, dtype=np.int32)
+    
+    scan_again = 1
+    scan_times = 0
+    
+    while scan_again:
+        scan_again = 0
+        
+        for i in range(ob.num_blobs):
+            if closest_ob[i] != -1:
+                continue
+            
+            b2 = ob.blobs[i]
+            closest_j = -1
+            closest_distsq = -1
+            
+            for j in range(last_ob.num_blobs):
+                b1 = last_ob.blobs[j]
+                
+                x = b1['x'] + b1['vx']
+                y = b1['y'] + b1['vy']
+                
+                dx = abs_val(x - b2['x'])
+                dy = abs_val(y - b2['y'])
+                distsq = dx * dx + dy * dy
+                
+                if closest_distsq < 0 or distsq < closest_distsq:
+                    if closest_last_ob[j] != -1 and closest_last_ob_distsq[j] <= distsq:
+                        continue
+                    closest_j = j
+                    closest_distsq = distsq
+            
+            closest_ob[i] = closest_j
+            
+            if closest_j < 0:
+                continue
+            
+            if closest_last_ob[closest_j] != -1:
+                closest_ob[closest_last_ob[closest_j]] = -1
+                scan_again += 1
+            
+            closest_last_ob[closest_j] = i
+            closest_last_ob_distsq[closest_j] = closest_distsq
+        
+        scan_times += 1
+        if scan_times > 100:
+            print(f"Warning: blob matching looped excessively. scan_times: {scan_times}")
+            break
+    
+    for i in range(ob.num_blobs):
+        if closest_ob[i] < 0:
+            continue
+        
+        b2 = ob.blobs[i]
+        b1 = last_ob.blobs[closest_ob[i]]
+        
+        if b1['track_index'] >= 0 and ob.tracked[b1['track_index']] == 0:
+            b2['track_index'] = b1['track_index']
+            ob.tracked[b2['track_index']] = i + 1
+        
+        copy_matching_blob(b2, b1)
+    
+    for i in range(MAX_BLOBS_PER_FRAME):
+        t = ob.tracked[i]
+        if t > 0 and ob.blobs[t - 1]['track_index'] != i:
+            ob.tracked[i] = 0
+    
+    for i in range(ob.num_blobs):
+        b2 = ob.blobs[i]
+        if b2['age'] > 0 and b2['track_index'] < 0:
+            b2['track_index'] = find_free_track(ob.tracked)
+        if b2['track_index'] >= 0:
+            ob.tracked[b2['track_index']] = i + 1
+    
+    bw.last_observation = ob
+    return ob
 
-    def release_observation(self, observation):
+def blobwatch_find_blob_at(bw: Blobwatch, x: int, y: int) -> Optional[np.ndarray]:
+    if bw.last_observation is None:
+        return None
+    
+    ob = bw.last_observation
+    for i in range(ob.num_blobs):
+        b = ob.blobs[i]
+        dx = abs_val(x - b['x'])
+        dy = abs_val(y - b['y'])
+        
+        if 2 * dx <= b['width'] and 2 * dy <= b['height']:
+            return b
+    
+    return None
 
-        self.observation_buffer.append(observation)
+def blobwatch_update_labels(bw: Blobwatch, ob: Blobservation, device_id: int):
+    last_ob = bw.last_observation
+    
+    if last_ob is None or last_ob == ob:
+        for i in range(ob.num_blobs):
+            b = ob.blobs[i]
+            if b['led_id'] != LED_INVALID_ID and b['led_id'] == b['prev_led_id']:
+                b['id_age'] += 1
+            else:
+                b['id_age'] = 0
+        return
+    
+    for l in range(last_ob.num_blobs):
+        new_b = last_ob.blobs[l]
+        if (new_b['led_id'] >> 8) == device_id:
+            new_b['prev_led_id'] = new_b['led_id']
+            new_b['led_id'] = LED_INVALID_ID
+    
+    for i in range(ob.num_blobs):
+        b = ob.blobs[i]
+        if (b['led_id'] >> 8) != device_id:
+            continue
+        
+        for l in range(last_ob.num_blobs):
+            new_b = last_ob.blobs[l]
+            if new_b['blob_id'] == b['blob_id']:
+                if bw.debug:
+                    print(f"Found matching blob {b['blob_id']} with labelled with LED id {b['led_id']:x}")
+                new_b['led_id'] = b['led_id']
+                
+                if new_b['led_id'] == new_b['prev_led_id']:
+                    new_b['id_age'] += 1
+                else:
+                    new_b['id_age'] = 0
+
+def blobwatch_release_observation(bw: Blobwatch, ob: Blobservation):
+    bw.observation_q.push(ob)
+
+
+# Example usage
+if __name__ == "__main__":
+    bw = Blobwatch(pixel_threshold=10, blob_required_threshold=20)
+
+    frame = np.zeros((480, 640), dtype=np.uint8)
+    frame[100:110, 100:110] = 100
+    frame[200:215, 300:315] = 150
+    frame[350:360, 500:510] = 200
+    
+    observation = blobwatch_process(bw, frame)
+    
+    if observation:
+        print(f"Found {observation.num_blobs} blobs")
+        for i in range(observation.num_blobs):
+            blob = observation.blobs[i]
+            print(f"Blob {i}: id={blob['blob_id']}, pos=({blob['x']:.2f}, {blob['y']:.2f}), "
+                  f"size={blob['width']}x{blob['height']}, brightness={blob['brightness']}")
+        
+        blobwatch_release_observation(bw, observation)
