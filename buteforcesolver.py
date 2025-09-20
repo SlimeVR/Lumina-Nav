@@ -1,689 +1,715 @@
-import itertools
+from __future__ import annotations
+import math
+import os
+import warnings
+from dataclasses import dataclass
+from typing import List, Optional, Tuple, Dict, Any
+
 import numpy as np
 import cv2
-from typing import List, Dict, Tuple, Optional, Set
-from numba import jit, prange, njit
-import time
-@njit
-def _fast_pairwise_dists_2d(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Fast 2D pairwise distance computation"""
-    Na = a.shape[0]
-    Nb = b.shape[0]
-    result = np.zeros((Na, Nb), dtype=np.float64)
-    for i in range(Na):
-        for j in range(Nb):
-            dx = a[i, 0] - b[j, 0]
-            dy = a[i, 1] - b[j, 1]
-            result[i, j] = dx * dx + dy * dy
-    return result
 
-@njit
-def _fast_pairwise_dists_3d(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Fast 3D pairwise distance computation"""
-    Na = a.shape[0]
-    Nb = b.shape[0]
-    result = np.zeros((Na, Nb), dtype=np.float64)
-    for i in range(Na):
-        for j in range(Nb):
-            dx = a[i, 0] - b[j, 0]
-            dy = a[i, 1] - b[j, 1]
-            dz = a[i, 2] - b[j, 2]
-            result[i, j] = dx * dx + dy * dy + dz * dz
-    return result
+try:
+    from numba import njit, prange
+    NUMBA_AVAILABLE = True
+except Exception:
+    def njit(*args, **kwargs):
+        def deco(f):
+            return f
+        return deco
+    prange = range
+    NUMBA_AVAILABLE = False
 
-@njit
-def _fast_norm_squared(a, b):
-    """Fast squared Euclidean distance between two 2D points"""
-    return (a[0] - b[0])**2 + (a[1] - b[1])**2
+MAX_LED_SEARCH_DEPTH = 8
+MAX_BLOB_SEARCH_DEPTH = 16
 
-@njit
-def _fast_score_correspondences(proj_points, centers_px, radii, facing_mask):
-    N = proj_points.shape[0]
-    M = centers_px.shape[0]
-    
-    used_blob = np.zeros(M, dtype=np.bool_)
-    inliers = 0
-    sqerr = 0.0
-    
-    #pre-allocate arrays for correspondences
-    led_indices = np.full(N, -1, dtype=np.int32)
-    det_indices = np.full(N, -1, dtype=np.int32)
-    correspondence_count = 0
-    
-    for i in range(N):
-        if not facing_mask[i]:
-            continue
-            
-        #find nearest unused blob
-        best_distance_sq = np.inf
-        best_blob_idx = -1
-        
-        for j in range(M):
-            if used_blob[j]:
+POSE_MATCH_GOOD = 1 << 0
+POSE_MATCH_STRONG = 1 << 1
+
+CS_FLAG_SHALLOW_SEARCH      = 1 << 0
+CS_FLAG_DEEP_SEARCH         = 1 << 1
+CS_FLAG_MATCH_ALL_BLOBS     = 1 << 2
+CS_FLAG_STOP_FOR_STRONG     = 1 << 3
+CS_FLAG_HAVE_POSE_PRIOR     = 1 << 4
+CS_FLAG_MATCH_GRAVITY       = 1 << 5
+
+LED_INVALID_ID = 0xFFFF
+
+MIN_TRI_AREA_NORM = 1.5e-4   #minimum normalized image triangle area for P3P sampling
+MIN_PAIR_SEP_PX   = 2.0      #min pixel separation between any pair of P3P sample points
+
+@njit(cache=True, fastmath=True)
+def _quat_from_R_numba(R: np.ndarray) -> np.ndarray:
+    t = R[0, 0] + R[1, 1] + R[2, 2]
+    q = np.empty(4, dtype=np.float64)
+    if t > 0.0:
+        s = 0.5 / math.sqrt(t + 1.0)
+        q[3] = -0.25 / s
+        q[0] = -(R[2, 1] - R[1, 2]) * s
+        q[1] = -(R[0, 2] - R[2, 0]) * s
+        q[2] = -(R[1, 0] - R[0, 1]) * s
+    else:
+        if R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+            s = 2.0 * math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+            q[3] = -(R[2, 1] - R[1, 2]) / s
+            q[0] = -0.25 * s
+            q[1] = -(R[0, 1] + R[1, 0]) / s
+            q[2] = -(R[0, 2] + R[2, 0]) / s
+        elif R[1, 1] > R[2, 2]:
+            s = 2.0 * math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+            q[3] = -(R[0, 2] - R[2, 0]) / s
+            q[0] = -(R[0, 1] + R[1, 0]) / s
+            q[1] = -0.25 * s
+            q[2] = -(R[1, 2] + R[2, 1]) / s
+        else:
+            s = 2.0 * math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+            q[3] = -(R[1, 0] - R[0, 1]) / s
+            q[0] = -(R[0, 2] + R[2, 0]) / s
+            q[1] = -(R[1, 2] + R[2, 1]) / s
+            q[2] = -0.25 * s
+    n = math.sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3])
+    if n > 0.0:
+        q[0] /= n; q[1] /= n; q[2] /= n; q[3] /= n
+    return q
+
+def quat_from_R(R: np.ndarray) -> np.ndarray:
+    return _quat_from_R_numba(R.astype(np.float64))
+
+@njit(cache=True, fastmath=True, parallel=True)
+def _sorted_sqdist_indices(coords: np.ndarray) -> np.ndarray:
+    N = coords.shape[0]
+    out = np.empty((N, N-1), np.int32)
+    for i in prange(N):
+        xi = coords[i, 0]; yi = coords[i, 1]
+        d2 = np.empty(N-1, np.float64)
+        idx = np.empty(N-1, np.int32)
+        c = 0
+        for j in range(N):
+            if j == i:
                 continue
-            dist_sq = _fast_norm_squared(proj_points[i], centers_px[j])
-            if dist_sq < best_distance_sq:
-                best_distance_sq = dist_sq
-                best_blob_idx = j
-        
-        if best_blob_idx >= 0:
-            dist = np.sqrt(best_distance_sq)
-            if dist <= radii[best_blob_idx]:
-                used_blob[best_blob_idx] = True
-                inliers += 1
-                sqerr += best_distance_sq
-                
-                #store correspondence
-                led_indices[correspondence_count] = i
-                det_indices[correspondence_count] = best_blob_idx
-                correspondence_count += 1
-    
-    return inliers, sqerr, led_indices[:correspondence_count], det_indices[:correspondence_count]
+            dx = coords[j, 0] - xi
+            dy = coords[j, 1] - yi
+            d2[c] = dx*dx + dy*dy
+            idx[c] = j
+            c += 1
+        order = np.argsort(d2)
+        out[i, :] = idx[order]
+    return out
 
-@njit
-def _fast_compute_scale_ratios(X, led_corr_items, centers_px, distance_to_target, focal_length, max_pairs=10):
-    scale_ratios = np.zeros(max_pairs, dtype=np.float64)
-    ratio_count = 0
-    
-    n_corr = len(led_corr_items)
-    for i in range(n_corr):
-        if ratio_count >= max_pairs:
-            break
-        for j in range(i + 1, n_corr):
-            if ratio_count >= max_pairs:
-                break
-                
-            led1_idx = led_corr_items[i, 0]
-            det1_idx = led_corr_items[i, 1]
-            led2_idx = led_corr_items[j, 0]
-            det2_idx = led_corr_items[j, 1]
-            
-            # 3D distance between LEDs
-            dx = X[led1_idx, 0] - X[led2_idx, 0]
-            dy = X[led1_idx, 1] - X[led2_idx, 1]
-            dz = X[led1_idx, 2] - X[led2_idx, 2]
-            world_dist = np.sqrt(dx*dx + dy*dy + dz*dz)
-            
-            if world_dist < 15.0:  #skip very close LED pairs
-                continue
-            
-            #2D distance between detections
-            px_dx = centers_px[det1_idx, 0] - centers_px[det2_idx, 0]
-            px_dy = centers_px[det1_idx, 1] - centers_px[det2_idx, 1]
-            pixel_dist = np.sqrt(px_dx*px_dx + px_dy*px_dy)
-            
-            #expected pixel distance
-            expected_pixel_dist = (world_dist * focal_length) / distance_to_target
-            
-            if expected_pixel_dist > 1.0:
-                scale_ratios[ratio_count] = pixel_dist / expected_pixel_dist
-                ratio_count += 1
-    
-    return scale_ratios[:ratio_count]
+@dataclass
+class Blob:
+    x: float
+    y: float
+    width: float
+    height: float
+    led_id: int = LED_INVALID_ID
 
+@dataclass
+class ImagePoint:
+    point_homog: np.ndarray  #undistorted normalized
+    size: np.ndarray         #normalized
+    max_dist: float
+    blob: Blob
+    neighbours: List[int]
 
-class SolvePoseBruteOptimized:
+@dataclass
+class LED:
+    pos: np.ndarray  #(3,)
+    dir: np.ndarray  #(3,)
+    id: int
+
+@dataclass
+class LEDNeighborList:
+    led_index: int
+    neighbours: List[int]
+
+@dataclass
+class PoseMetrics:
+    matched_blobs: int = 0
+    visible_leds: int = 0
+    unmatched_blobs: int = 0
+    reprojection_error: float = 0.0
+    match_flags: int = 0
+
+class CorrespondenceSearch:
     def __init__(
         self,
-        K: np.ndarray,
-        dist: Optional[np.ndarray],
-        world_points: np.ndarray,
-        normals: Optional[np.ndarray] = None,
-        max_led_depth: int = 8,
-        max_blob_depth: int = 8,
-        shallow_search: bool = True,
-        stop_on_strong: bool = True,
-        strong_min_inliers: int = 7,
-        strong_px_err_per_inlier: float = 1.5,
-        adaptive_search: bool = True,
-        max_iterations: int = 10000,
-        use_temporal: bool = True, 
-        distance_adaptive: bool = True,
-    ):
-        self.K = K.astype(np.float64)
-        self.dist = np.zeros((5, 1), np.float64) if dist is None else dist.astype(np.float64).reshape(-1, 1)
-        self.X = world_points.astype(np.float64)
-        self.normals = normals.astype(np.float64) if normals is not None else None
+        camera_matrix: np.ndarray,
+        dist_coeffs: np.ndarray,
+        led_positions: np.ndarray,
+        led_normals: np.ndarray,
+        led_ids: Optional[np.ndarray] = None,
+        model_id: int = 0,
+        max_led_search_depth: int = MAX_LED_SEARCH_DEPTH,
+        max_blob_search_depth: int = MAX_BLOB_SEARCH_DEPTH,
+        parallel_anchors: bool = False,
+        max_cv_threads: Optional[int] = None,
+    ) -> None:
+        self.K = np.ascontiguousarray(camera_matrix, dtype=np.float64)
+        self.dist = np.ascontiguousarray(dist_coeffs.reshape(-1), dtype=np.float64)
+        self.fx = float(self.K[0, 0]); self.fy = float(self.K[1, 1])
+        self.cx = float(self.K[0, 2]); self.cy = float(self.K[1, 2])
 
-        self.N = self.X.shape[0]
-        self.max_led_depth = int(max(3, max_led_depth))
-        self.max_blob_depth = int(max(3, max_blob_depth))
-        self.shallow_search = shallow_search
-        self.stop_on_strong = stop_on_strong
-        self.strong_min_inliers = strong_min_inliers
-        self.strong_px_err_per_inlier = strong_px_err_per_inlier
-        self.adaptive_search = adaptive_search
-        self.max_iterations = max_iterations
-        self.use_temporal = use_temporal
-        self.distance_adaptive = distance_adaptive
-
-        d3 = _fast_pairwise_dists_3d(self.X, self.X)
-        order = np.argsort(d3, axis=1)
-        keep = min(self.N, 1 + self.max_led_depth)
-        self.led_neighbors: List[np.ndarray] = [order[i, :keep] for i in range(self.N)]
-        
-        self._projection_cache = {}
-        self._last_pose_hash = None
-        
-        self._last_rvec = None
-        self._last_tvec = None
-        self._last_distance = None
-        self._last_inlier_count = None
-        
-        self.fx = K[0, 0]
-        self.fy = K[1, 1]
-        self.avg_focal_length = (self.fx + self.fy) / 2.0
-        
-        if self.N > 1:
-            led_distances = []
-            for i in range(min(10, self.N)):
-                for j in range(i+1, min(10, self.N)):
-                    led_distances.append(np.linalg.norm(self.X[i] - self.X[j]))
-            self.avg_led_spacing = np.median(led_distances) if led_distances else 30.0
-        else:
-            self.avg_led_spacing = 30.0
-        
-        self.stats = {
-            'iterations_tested': 0,
-            'p3p_calls': 0,
-            'early_terminations': 0,
-            'cache_hits': 0,
-            'temporal_success': 0,
-            'solve_time': 0.0
-        }
-
-    def _get_pose_hash(self, rvec, tvec):
-        return hash((tuple(rvec.flatten()), tuple(tvec.flatten())))
-
-    @staticmethod
-    def _centers_from_detections(dets: List[Dict], assume_top_left: bool = True) -> Tuple[np.ndarray, np.ndarray]:
-        M = len(dets)
-        centers = np.zeros((M, 2), dtype=np.float64)
-        sizes = np.zeros((M,), dtype=np.float64)
-        for i, d in enumerate(dets):
-            x, y = float(d["x"]), float(d["y"])
-            inner = float(d["inner"])
-            if assume_top_left:
-                cx = x + inner * 0.5
-                cy = y + inner * 0.5
-            else:
-                cx, cy = x, y
-            centers[i] = (cx, cy)
-            sizes[i] = inner
-        return centers, sizes
-
-    def _make_blob_neighbors(self, centers: np.ndarray) -> List[np.ndarray]:
-        M = centers.shape[0]
-        if M == 0:
-            return []
-        d2 = _fast_pairwise_dists_2d(centers, centers)
-        order = np.argsort(d2, axis=1)
-        keep = min(M, 1 + self.max_blob_depth)
-        return [order[i, :keep] for i in range(M)]
-
-    def _estimate_adaptive_radius(self, inner_sizes: np.ndarray, expected_distance: Optional[float] = None) -> np.ndarray:
-        if self.distance_adaptive and expected_distance is not None:
-            #estimate pixel size of LEDs at this distance
-            expected_pixel_size = (self.avg_led_spacing * self.fx) / expected_distance
-            
-            #set tolerance based on expected size with margin
-            adaptive_radius = min(50.0, max(10.0, expected_pixel_size * 2.5))
-            radii = np.full(len(inner_sizes), adaptive_radius, dtype=np.float64)
-        else:
-            radii = np.maximum(inner_sizes * 2.0, 15.0)
-            radii = np.minimum(radii, 50.0)  #cap at 50 pixels
-        
-        return radii
-
-    def _try_temporal_refinement(
-        self, 
-        centers_px: np.ndarray, 
-        radii: np.ndarray,
-        max_movement: float = 100.0
-    ) -> Optional[Tuple[np.ndarray, np.ndarray, Dict]]:
-        if not self.use_temporal or self._last_rvec is None or self._last_tvec is None:
-            return None
-            
-        try:
-            proj, _ = cv2.projectPoints(self.X, self._last_rvec, self._last_tvec, self.K, self.dist)
-            proj_points = proj.reshape(-1, 2).astype(np.float64)
-        except cv2.error:
-            return None
-        
-        #check facing
-        if self.normals is not None:
-            R, _ = cv2.Rodrigues(self._last_rvec)
-            Xc = (R @ self.X.T + self._last_tvec).T
-            Nc = (R @ self.normals.T).T
-            view_dir = Xc / np.maximum(1e-9, np.linalg.norm(Xc, axis=1, keepdims=True))
-            facing = (np.sum(view_dir * Nc, axis=1) <= 0.0)
-        else:
-            facing = np.ones(self.N, dtype=np.bool_)
-        
-        inliers, sqerr, led_indices, det_indices = _fast_score_correspondences(
-            proj_points, centers_px, radii * 0.7, facing
-        )
-        
-        if inliers >= max(4, self._last_inlier_count * 0.7 if self._last_inlier_count else 4):
-            correspondences = {}
-            object_points = []
-            image_points = []
-            
-            for i in range(len(led_indices)):
-                led_idx = int(led_indices[i])
-                det_idx = int(det_indices[i])
-                correspondences[led_idx] = det_idx
-                object_points.append(self.X[led_idx])
-                image_points.append(centers_px[det_idx])
-            
-            if len(object_points) >= 4:
-                object_points = np.array(object_points, dtype=np.float64)
-                image_points = np.array(image_points, dtype=np.float64).reshape(-1, 1, 2)
-                
-                try:
-                    success, refined_rvec, refined_tvec = cv2.solvePnP(
-                        object_points, image_points, self.K, self.dist,
-                        rvec=self._last_rvec.copy(), tvec=self._last_tvec.copy(),
-                        useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE
-                    )
-                    
-                    if success:
-                        movement = np.linalg.norm(refined_tvec - self._last_tvec)
-                        if movement < max_movement:
-                            self.stats['temporal_success'] += 1
-                            return refined_rvec, refined_tvec, correspondences
-                except cv2.error:
-                    pass
-        
-        return None
-
-    def _validate_pose_geometry(
-        self, 
-        rvec: np.ndarray, 
-        tvec: np.ndarray, 
-        correspondences: Dict[int, int], 
-        centers_px: np.ndarray
-    ) -> bool:
-        if len(correspondences) < 3:
-            return False
-            
-        distance_to_target = np.linalg.norm(tvec)
-        
-        if distance_to_target < 50.0 or distance_to_target > 5000.0:
-            return False
-        
-        corr_array = np.array(list(correspondences.items()), dtype=np.int32)
-        
-        scale_ratios = _fast_compute_scale_ratios(
-            self.X, corr_array, centers_px, 
-            distance_to_target, self.avg_focal_length, max_pairs=10
-        )
-        
-        if len(scale_ratios) == 0:
-            return True
-        
-        median_ratio = np.median(scale_ratios)
-        std_ratio = np.std(scale_ratios)
-        
-        distance_factor = min(2.0, distance_to_target / 500.0)
-        
-        min_scale = 0.3 / max(1.0, distance_factor)
-        max_scale = 3.0 * max(1.0, distance_factor)
-        
-        if median_ratio < min_scale or median_ratio > max_scale:
-            return False
-        
-        max_allowed_std = 0.3 + (0.2 * distance_factor)
-        if std_ratio > max_allowed_std:
-            return False
-        
-        outlier_count = np.sum(np.abs(scale_ratios - median_ratio) > 2.0 * max(std_ratio, 0.1))
-        if outlier_count > len(scale_ratios) * 0.4:
-            return False
-            
-        return True
-
-    def _score_pose_fast(
-        self, 
-        rvec: np.ndarray, 
-        tvec: np.ndarray, 
-        centers_px: np.ndarray, 
-        radii: np.ndarray
-    ) -> Tuple[int, float, Dict]:
-
-        pose_hash = self._get_pose_hash(rvec, tvec)
-        if pose_hash == self._last_pose_hash and pose_hash in self._projection_cache:
-            proj_points = self._projection_cache[pose_hash]
-            self.stats['cache_hits'] += 1
-        else:
+        if max_cv_threads is not None:
             try:
-                proj, _ = cv2.projectPoints(self.X, rvec, tvec, self.K, self.dist)
-                proj_points = proj.reshape(-1, 2).astype(np.float64)
+                cv2.setNumThreads(int(max_cv_threads))
+            except Exception:
+                pass
 
-                if len(self._projection_cache) > 100:
-                    self._projection_cache.clear()
-                self._projection_cache[pose_hash] = proj_points
-                self._last_pose_hash = pose_hash
-            except cv2.error:
-                return 0, np.inf, {}
+        led_positions = np.asarray(led_positions, dtype=np.float64)
+        led_normals   = np.asarray(led_normals,   dtype=np.float64)
 
-        if self.normals is not None:
-            R, _ = cv2.Rodrigues(rvec)
-            Xc = (R @ self.X.T + tvec).T
-            Nc = (R @ self.normals.T).T
-            view_dir = Xc / np.maximum(1e-9, np.linalg.norm(Xc, axis=1, keepdims=True))
-            facing = (np.sum(view_dir * Nc, axis=1) <= 0.0)
+        if led_positions.ndim != 2 or led_positions.shape[0] == 0:
+            raise ValueError(f"led_positions must be (N,3); got shape {led_positions.shape}")
+        if led_positions.shape[1] < 3:
+            raise ValueError(f"led_positions must have 3 columns; got {led_positions.shape[1]}")
+        if led_positions.shape[1] > 3:
+            warnings.warn(f"led_positions has {led_positions.shape[1]} columns; using the first 3.", RuntimeWarning)
+            led_positions = led_positions[:, :3]
+
+        if led_normals.ndim == 1:
+            if led_normals.size == 3:
+                led_normals = np.tile(led_normals, (led_positions.shape[0], 1))
+            else:
+                raise ValueError(f"led_normals must be (N,3) or (3,); got length {led_normals.size}")
+        elif led_normals.ndim == 2:
+            if led_normals.shape[0] != led_positions.shape[0]:
+                raise ValueError(f"led_normals rows ({led_normals.shape[0]}) must match led_positions rows ({led_positions.shape[0]}).")
+            if led_normals.shape[1] < 3:
+                raise ValueError(f"led_normals must have at least 3 columns; got {led_normals.shape[1]}")
+            if led_normals.shape[1] > 3:
+                warnings.warn(f"led_normals has {led_normals.shape[1]} columns; using the first 3.", RuntimeWarning)
+                led_normals = led_normals[:, :3]
         else:
-            facing = np.ones(self.N, dtype=np.bool_)
+            raise ValueError(f"led_normals must be (N,3) or (3,); got shape {led_normals.shape}")
 
-        inliers, sqerr, led_indices, det_indices = _fast_score_correspondences(
-            proj_points, centers_px, radii, facing
-        )
-        
-        rmse = float(np.sqrt(sqerr / max(1, inliers)))
-    
-        correspondences = {}
-        for i in range(len(led_indices)):
-            correspondences[int(led_indices[i])] = int(det_indices[i])
-        
-        return inliers, rmse, correspondences
+        led_positions = np.ascontiguousarray(led_positions, dtype=np.float64)
+        led_normals   = np.ascontiguousarray(led_normals,   dtype=np.float64)
 
-    @staticmethod
-    def _is_better(inliers: int, rmse: float, best_inliers: int, best_rmse: float) -> bool:
-        if inliers > best_inliers:
-            return True
-        if inliers == best_inliers and rmse < best_rmse:
-            return True
-        return False
+        self.model_id = int(model_id)
+        self.leds: List[LED] = []
+        for i in range(led_positions.shape[0]):
+            pos = led_positions[i]
+            nrm = led_normals[i]
+            nrm = nrm[:3] / (np.linalg.norm(nrm[:3]) + 1e-12)
+            lid = int(led_ids[i]) if led_ids is not None else i
+            self.leds.append(LED(pos=pos.copy(), dir=nrm.copy(), id=lid))
+        self.N_leds = len(self.leds)
 
-    def _search_with_depths(
-        self, 
-        max_led_depth: int,
-        max_blob_depth: int,
-        centers_px: np.ndarray,
-        radii: np.ndarray,
-        blob_neighbors: List[np.ndarray],
-        best: Dict,
-        distance_hint: Optional[float] = None
-    ) -> bool:
-        iterations = 0
-        found_improvement = False
-        
-        #adaptive limits based on distance
-        if self.distance_adaptive and distance_hint is not None:
-            if distance_hint > 1500:  #far
-                blob_anchor_limit = min(3, len(blob_neighbors))
-                led_combination_limit = 10
-                blob_combination_limit = 5
-            elif distance_hint > 800:  #med
-                blob_anchor_limit = min(4, len(blob_neighbors))
-                led_combination_limit = 15
-                blob_combination_limit = 8
-            else:  #close
-                blob_anchor_limit = min(5, len(blob_neighbors))
-                led_combination_limit = 20
-                blob_combination_limit = 10
-        else:
-            blob_anchor_limit = min(5, len(blob_neighbors))
-            led_combination_limit = 20
-            blob_combination_limit = 10
-        
-        #sort LED anchors by connectivity
-        led_anchor_order = list(range(len(self.led_neighbors)))
-        led_anchor_order.sort(key=lambda i: len(self.led_neighbors[i]), reverse=True)
-        
-        #limit LED anchors
-        max_led_anchors = min(10, len(led_anchor_order))
-        
-        for li in led_anchor_order[:max_led_anchors]:
-            led_nbrs_full = self.led_neighbors[li]
-            if len(led_nbrs_full) < 4:
-                continue
-                
-            led_nbrs = led_nbrs_full[1: 1 + max_led_depth]
-            if led_nbrs.shape[0] < 3:
-                continue
+        self._led_pos_T = np.ascontiguousarray(np.stack([ld.pos for ld in self.leds], axis=1), dtype=np.float64)
+        self._led_dir_T = np.ascontiguousarray(np.stack([ld.dir for ld in self.leds], axis=1), dtype=np.float64)
 
-            #early termination check
-            if iterations > self.max_iterations:
-                self.stats['early_terminations'] += 1
-                break
+        self.max_led_search_depth = int(max_led_search_depth)
+        self.max_blob_search_depth = int(max_blob_search_depth)
+        self.led_neighbors: List[LEDNeighborList] = self._build_led_neighbors()
 
-            #generate LED combinations
-            led_combinations = list(itertools.combinations(led_nbrs, 3))
-            if len(led_combinations) > led_combination_limit:
-                #sample combinations uniformly
-                indices = np.linspace(0, len(led_combinations)-1, led_combination_limit, dtype=int)
-                led_combinations = [led_combinations[i] for i in indices]
+        self._blobs: List[Blob] = []
+        self._points: List[ImagePoint] = []
+        self._blob_neighbours: List[List[int]] = []
 
-            for (j1, j2, j3) in led_combinations:
-                led_quad = np.array([li, j1, j2, j3], dtype=int)
+        self.z_min = 0.05
+        self.z_max = 25.0
+        self.backcheck_tol_norm = 4.0e-3
+        self.strong_min_inliers = 11
+        self.strong_max_rmse_px = 2.0
+        self.gate_px_scale = 0.7
 
-                for perm in [(0, 1, 2, 3), (0, 2, 1, 3)]:
-                    led_idx = led_quad[list(perm)]
-                    X3 = self.X[led_idx[:3]]
-                    X4 = self.X[led_idx[3]]
+        self.parallel_anchors = bool(parallel_anchors)
+        self.max_workers = min(8, (os.cpu_count() or 4))
 
-                    for bi in range(blob_anchor_limit):
-                        blob_nbrs_full = blob_neighbors[bi]
-                        if len(blob_nbrs_full) < 4:
-                            continue
-                            
-                        blob_nbrs = blob_nbrs_full[1: 1 + max_blob_depth]
-                        if blob_nbrs.shape[0] < 3:
-                            continue
+        self._eye3 = np.eye(3, dtype=np.float64)
+        self._p3p_obj = np.empty((3, 3), np.float64)
+        self._p3p_img = np.empty((3, 2), np.float64)
+        self._proj_buf = None  #will be (3, N_leds)
 
-                        #generate blob combinations
-                        blob_combinations = list(itertools.combinations(blob_nbrs, 3))
-                        if len(blob_combinations) > blob_combination_limit:
-                            indices = np.linspace(0, len(blob_combinations)-1, blob_combination_limit, dtype=int)
-                            blob_combinations = [blob_combinations[i] for i in indices]
 
-                        for (k1, k2, k3) in blob_combinations:
-                            iterations += 1
-                            if iterations > self.max_iterations:
-                                break
-                                
-                            blob_quad = np.array([bi, k1, k2, k3], dtype=int)
+    def set_blobs(self, blobs: List[Blob], search_flags: int = 0) -> None:
+        self._blobs = list(blobs)
+        N = len(blobs)
+        if N == 0:
+            self._points = []
+            self._blob_neighbours = []
+            return
 
-                            #P3P solve
-                            img3 = centers_px[blob_quad[:3]].reshape(-1, 1, 2)
-                            self.stats['p3p_calls'] += 1
-                            
-                            try:
-                                ok, rvecs, tvecs = cv2.solveP3P(
-                                    X3.astype(np.float64), img3.astype(np.float64),
-                                    self.K, self.dist, flags=cv2.SOLVEPNP_P3P
-                                )
-                            except cv2.error:
-                                continue
-                                
-                            if not ok:
-                                continue
+        pix = np.ascontiguousarray([[b.x, b.y] for b in blobs], dtype=np.float64).reshape(-1, 1, 2)
+        undist = cv2.undistortPoints(pix, self.K, self.dist).reshape(-1, 2)
 
-                            #4th point validation
-                            img4 = centers_px[blob_quad[3]].reshape(1, 1, 2)
-                            r_tol = radii[blob_quad[3]]
+        points: List[ImagePoint] = []
+        for i, b in enumerate(blobs):
+            ph = np.array([undist[i, 0], undist[i, 1], 1.0], dtype=np.float64)
+            sx = b.width / self.fx
+            sy = b.height / self.fy
+            md = float(math.hypot(sx, sy))
+            points.append(ImagePoint(point_homog=ph, size=np.array([sx, sy], dtype=np.float64), max_dist=md, blob=b, neighbours=[]))
+        self._points = points
 
-                            for rv, tv in zip(rvecs, tvecs):
-                                #Quick 4th point check
-                                try:
-                                    proj4, _ = cv2.projectPoints(X4.reshape(1, 3), rv, tv, self.K, self.dist)
-                                    p4 = proj4.reshape(2)
-                                    err4 = np.linalg.norm(p4 - img4.reshape(2))
-                                    
-                                    if err4 > r_tol:
-                                        continue
-                                except cv2.error:
-                                    continue
+        coords = np.ascontiguousarray([[b.x, b.y] for b in blobs], dtype=np.float64)
+        all_sorted = _sorted_sqdist_indices(coords) if NUMBA_AVAILABLE and N >= 3 else None
+        neigh_lists: List[List[int]] = []
+        for i in range(N):
+            order = list(all_sorted[i]) if all_sorted is not None else np.argsort(np.sum((coords - coords[i])**2, axis=1)).tolist()
+            order = [int(j) for j in order if j != i]
 
-                                #Full pose scoring
-                                inliers, rmse, correspondences = self._score_pose_fast(rv, tv, centers_px, radii)
-                                
-                                #Apply distance prior if available
-                                if self.distance_adaptive and distance_hint is not None and inliers > 0:
-                                    actual_distance = np.linalg.norm(tv)
-                                    distance_error = abs(actual_distance - distance_hint) / distance_hint
-                                    if distance_error > 0.5:  # More than 50% off
-                                        rmse *= (1.0 + distance_error * 0.5)  # Penalize
-                                
-                                if self._is_better(inliers, rmse, best["inliers"], best["reproj_rmse"]):
-                                    # Additional geometry validation for significant improvements
-                                    if inliers > best["inliers"] + 2 or (inliers == best["inliers"] and rmse < best["reproj_rmse"] * 0.7):
-                                        if self._validate_pose_geometry(rv, tv, correspondences, centers_px):
-                                            best.update({
-                                                "inliers": inliers,
-                                                "reproj_rmse": rmse,
-                                                "rvec": rv.copy(),
-                                                "tvec": tv.copy(),
-                                                "led_correspondences": correspondences,
-                                            })
-                                            found_improvement = True
-                                    else:
-                                        #Minor improvement, accept without validation
-                                        best.update({
-                                            "inliers": inliers,
-                                            "reproj_rmse": rmse,
-                                            "rvec": rv.copy(),
-                                            "tvec": tv.copy(),
-                                            "led_correspondences": correspondences,
-                                        })
-                                        found_improvement = True
+            K = self.max_blob_search_depth
+            filtered: List[int] = []
 
-                                    #Dynamic early termination based on distance
-                                    if self.stop_on_strong:
-                                        if distance_hint is not None and distance_hint > 1000:
-                                            # Lower requirements at distance
-                                            if inliers >= max(5, self.strong_min_inliers - 2) and rmse <= self.strong_px_err_per_inlier * 1.5:
-                                                self.stats['iterations_tested'] = iterations
-                                                return True
-                                        else:
-                                            # Normal requirements
-                                            if inliers >= self.strong_min_inliers and rmse <= self.strong_px_err_per_inlier:
-                                                self.stats['iterations_tested'] = iterations
-                                                return True
+            if (search_flags & CS_FLAG_MATCH_ALL_BLOBS) != 0:
+                if len(order) <= K:
+                    filtered = order
+                else:
+                    half = K // 2
+                    filtered = order[:half] + order[-half:]
+            else:
+                #respect led_id if present, but still prefer spread: alternate near/far
+                lo, hi = 0, len(order) - 1
+                while len(filtered) < min(K, len(order)) and lo <= hi:
+                    for idx in (lo, hi):
+                        if 0 <= idx < len(order):
+                            j = order[idx]
+                            lid = self._blobs[j].led_id
+                            if lid == LED_INVALID_ID or self._same_model(lid):
+                                if j not in filtered:
+                                    filtered.append(j)
+                                    if len(filtered) >= K:
+                                        break
+                    lo += 1; hi -= 1
 
-        self.stats['iterations_tested'] = iterations
-        return found_improvement
+            neigh_lists.append(filtered)
+        self._blob_neighbours = neigh_lists
+        for i, ip in enumerate(self._points):
+            ip.neighbours = neigh_lists[i]
 
     def solve(
         self,
-        detections: List[Dict],
-        frame_shape: Tuple[int, int],
-        assume_top_left: bool = True,
-        debug_draw_frame: Optional[np.ndarray] = None,
-        expected_distance: Optional[float] = None,  # Hint for expected distance
-        max_temporal_movement: float = 100.0,  # Max movement between frames
-    ) -> Tuple[bool, Optional[np.ndarray], Optional[np.ndarray], Dict]:
-        start_time = time.time()
-        
-        #reset stats
-        self.stats = {k: 0 if k != 'solve_time' else 0.0 for k in self.stats}
-        
-        H, W = frame_shape[:2]
-        if len(detections) < 4 or self.N < 4:
-            return False, None, None, {"error": "insufficient_points"}
+        search_flags: int = (CS_FLAG_SHALLOW_SEARCH | CS_FLAG_DEEP_SEARCH | CS_FLAG_STOP_FOR_STRONG),
+        pose_prior: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+        pos_error_thresh: Optional[np.ndarray] = None,
+        rot_error_thresh: Optional[np.ndarray] = None,
+        gravity_vector: Optional[np.ndarray] = None,
+        gravity_tolerance_rad: float = math.radians(15.0),
+    ) -> Tuple[bool, Dict[str, Any]]:
+        if len(self._points) == 0:
+            return False, {"reason": "no blobs"}
 
-        #extract centers and setup
-        centers_px, inner_sizes = self._centers_from_detections(detections, assume_top_left)
-        
-        #use last distance as hint if not provided
-        if expected_distance is None and self._last_distance is not None:
-            expected_distance = self._last_distance
-        
-        #calculate adaptive radii
-        radii = self._estimate_adaptive_radius(inner_sizes, expected_distance)
-        
-        #try temporal refinement first
-        temporal_result = self._try_temporal_refinement(centers_px, radii, max_temporal_movement)
-        if temporal_result is not None:
-            refined_rvec, refined_tvec, correspondences = temporal_result
-            
-            #update tracking
-            self._last_rvec = refined_rvec
-            self._last_tvec = refined_tvec
-            self._last_distance = np.linalg.norm(refined_tvec)
-            self._last_inlier_count = len(correspondences)
-            
-            self.stats['solve_time'] = time.time() - start_time
-             
-            return True, refined_rvec, refined_tvec, {
-                "inliers": len(correspondences),
-                "reproj_rmse": 0.0,  #could compute if needed
-                "led_correspondences": correspondences,
-                "used_temporal": True,
-                **self.stats
+        if (search_flags & (CS_FLAG_SHALLOW_SEARCH | CS_FLAG_DEEP_SEARCH)) == 0:
+            search_flags |= CS_FLAG_SHALLOW_SEARCH | CS_FLAG_DEEP_SEARCH
+
+        if (search_flags & CS_FLAG_SHALLOW_SEARCH) != 0:
+            max_blob_depth = min(4, self.max_blob_search_depth)
+            max_led_depth = min(4, self.max_led_search_depth)
+            min_led_depth = 1
+        else:
+            max_blob_depth = self.max_blob_search_depth
+            max_led_depth = self.max_led_search_depth
+            min_led_depth = 3
+        if (search_flags & CS_FLAG_DEEP_SEARCH) != 0:
+            max_blob_depth = self.max_blob_search_depth
+            max_led_depth = self.max_led_search_depth
+
+        use_pose_prior = (search_flags & CS_FLAG_HAVE_POSE_PRIOR) != 0 and pose_prior is not None
+        use_gravity = (search_flags & CS_FLAG_MATCH_GRAVITY) != 0 and gravity_vector is not None and use_pose_prior
+        if use_gravity:
+            g = gravity_vector.astype(np.float64)
+            g = g / (np.linalg.norm(g) + 1e-12)
+            R0, _t0 = self._parse_pose_prior(pose_prior)
+            swing_prior, _ = self._quat_decompose_swing_twist(quat_from_R(R0), g)
+        else:
+            g = None
+            swing_prior = None
+
+        best_metrics = None
+        best_R = None
+        best_t = None
+        best_blob_depth = -1
+        best_led_depth = -1
+        num_trials = 0
+        num_pose_checks = 0
+
+        #iterate LED anchors
+        for l_idx, neigh in enumerate(self.led_neighbors):
+            candidates = neigh.neighbours
+            if len(candidates) < 3:
+                continue
+            start = min_led_depth - 1
+            end = min(len(candidates), max_led_depth)
+            led_slice = candidates[start:end]
+            if len(led_slice) < 3:
+                continue
+            L = len(led_slice)
+            for i1 in range(L):
+                for i2 in range(i1+1, L):
+                    for i3 in range(i2+1, L):
+                        ml = [l_idx, led_slice[i1], led_slice[i2], led_slice[i3]]
+                        for perm in ((0,1,2,3), (0,2,1,3)):
+                            model_leds = [ml[p] for p in perm]
+                            improved, out = self._check_led_match(
+                                model_leds, max_blob_depth,
+                                use_pose_prior, pose_prior,
+                                pos_error_thresh, rot_error_thresh,
+                                use_gravity, g, swing_prior,
+                                gravity_tolerance_rad,
+                            )
+                            num_trials += out.get('num_trials', 0)
+                            num_pose_checks += out.get('num_pose_checks', 0)
+
+                            cand_metrics = out.get('metrics', None)
+                            if improved and cand_metrics is not None:
+                                if (best_metrics is None) or self._is_better_pose(best_metrics, cand_metrics):
+                                    best_metrics = cand_metrics
+                                    best_R = out['R']; best_t = out['t']
+                                    best_led_depth = out['led_depth']; best_blob_depth = out['blob_depth']
+
+                                    if (best_metrics.match_flags & POSE_MATCH_STRONG) and (search_flags & CS_FLAG_STOP_FOR_STRONG):
+                                        ok = (best_metrics.match_flags & POSE_MATCH_GOOD) != 0
+                                        return ok, {
+                                            'R': best_R, 't': best_t, 'q': quat_from_R(best_R),
+                                            'metrics': best_metrics,
+                                            'num_trials': num_trials,
+                                            'num_pose_checks': num_pose_checks,
+                                            'best_led_depth': best_led_depth,
+                                            'best_blob_depth': best_blob_depth,
+                                        }
+
+        ok = best_metrics is not None and (best_metrics.match_flags & POSE_MATCH_GOOD) != 0
+        if ok:
+            return True, {
+                'R': best_R, 't': best_t, 'q': quat_from_R(best_R),
+                'metrics': best_metrics,
+                'num_trials': num_trials,
+                'num_pose_checks': num_pose_checks,
+                'best_led_depth': best_led_depth,
+                'best_blob_depth': best_blob_depth,
             }
-        
-        #full search
-        blob_neighbors = self._make_blob_neighbors(centers_px)
-        if not blob_neighbors:
-            return False, None, None, {"error": "no_blob_neighbors"}
+        else:
+            return False, {'reason': 'no good pose', 'metrics': best_metrics if best_metrics else PoseMetrics(), 'num_trials': num_trials, 'num_pose_checks': num_pose_checks}
+    
 
-        #best solution tracking
-        best = {
-            "inliers": -1,
-            "reproj_rmse": np.inf,
-            "rvec": None,
-            "tvec": None,
-            "led_correspondences": {},
+    def _same_model(self, led_id: int) -> bool:
+        return (led_id >> 16) == self.model_id
+
+    def _build_led_neighbors(self) -> List[LEDNeighborList]:
+        pos = np.stack([ld.pos for ld in self.leds], axis=0)
+        dirv = np.stack([ld.dir for ld in self.leds], axis=0)
+        out: List[LEDNeighborList] = []
+        for i in range(self.N_leds):
+            dots = dirv @ dirv[i]
+            ok = dots >= 0.0
+            ok[i] = False
+            d2 = np.sum((pos - pos[i])**2, axis=1)
+            idx = np.where(ok)[0]
+            idx_sorted = idx[np.argsort(d2[idx])]
+            out.append(LEDNeighborList(led_index=i, neighbours=list(map(int, idx_sorted[:self.max_led_search_depth]))))
+        return out
+
+    def _parse_pose_prior(self, pose_prior: Tuple[np.ndarray, np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
+        R_or_rvec, t = pose_prior
+        t = np.asarray(t, dtype=np.float64).reshape(3)
+        R_or_rvec = np.asarray(R_or_rvec, dtype=np.float64)
+        if R_or_rvec.shape == (3, 3):
+            R = R_or_rvec
+        else:
+            R, _ = cv2.Rodrigues(R_or_rvec.reshape(3,))
+        return R, t
+
+    def _quat_decompose_swing_twist(self, q: np.ndarray, axis: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        ax = axis / (np.linalg.norm(axis) + 1e-12)
+        qv = q[:3]
+        twist_axis = ax * (np.dot(qv, ax))
+        q_twist = np.array([twist_axis[0], twist_axis[1], twist_axis[2], q[3]], dtype=np.float64)
+        q_twist /= (np.linalg.norm(q_twist) + 1e-12)
+        q_twist_conj = np.array([-q_twist[0], -q_twist[1], -q_twist[2], q_twist[3]])
+        swing = self._quat_mul(q, q_twist_conj)
+        swing /= (np.linalg.norm(swing) + 1e-12)
+        return swing, q_twist
+
+    @staticmethod
+    def _quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        x1,y1,z1,w1 = a
+        x2,y2,z2,w2 = b
+        return np.array([
+            w1*x2 + x1*w2 + y1*z2 - z1*y2,
+            w1*y2 - x1*z2 + y1*w2 + z1*x2,
+            w1*z2 + x1*y2 - y1*x2 + z1*w2,
+            w1*w2 - x1*x2 - y1*y2 - z1*z2
+        ], dtype=np.float64)
+
+    @staticmethod
+    def _tri_area2_norm(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+        """Half of absolute 2D cross product magnitude for triangle area in normalized coords."""
+        ab = b - a; ac = c - a
+        return 0.5 * abs(ab[0]*ac[1] - ab[1]*ac[0])
+
+    def _check_led_match(
+        self,
+        model_led_indices: List[int],
+        max_blob_depth: int,
+        use_pose_prior: bool,
+        pose_prior: Optional[Tuple[np.ndarray, np.ndarray]],
+        pos_error_thresh: Optional[np.ndarray],
+        rot_error_thresh: Optional[np.ndarray],
+        use_gravity: bool,
+        gravity_vec: Optional[np.ndarray],
+        swing_prior: Optional[np.ndarray],
+        gravity_tolerance_rad: float,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        num_trials = 0
+        num_pose_checks = 0
+        improved_any = False
+        best_metrics = None
+        best_R = None
+        best_t = None
+        best_blob_depth = -1
+
+        led0, led1, led2, led3 = (self.leds[i] for i in model_led_indices)
+        Xbuf = self._p3p_obj; Xbuf[0,:]=led0.pos; Xbuf[1,:]=led1.pos; Xbuf[2,:]=led2.pos
+        d0, d1, d2 = led0.dir, led1.dir, led2.dir
+        xcheck = led3.pos
+
+        for b_anchor_idx in range(len(self._points)):
+            anchor = self._points[b_anchor_idx]
+            neigh = anchor.neighbours[:max_blob_depth]
+            if len(neigh) < 3:
+                continue
+            L = len(neigh)
+            for i in range(L):
+                for j in range(i+1, L):
+                    for k in range(j+1, L):
+                        ip0 = self._points[b_anchor_idx].point_homog[:2]
+                        ip1 = self._points[neigh[i]].point_homog[:2]
+                        ip2 = self._points[neigh[j]].point_homog[:2]
+                        ip3 = self._points[neigh[k]].point_homog[:2]
+
+                        area = self._tri_area2_norm(ip0, ip1, ip2)
+                        if area < MIN_TRI_AREA_NORM:
+                            continue
+
+                        def _px(p):
+                            return np.array([p[0]*self.fx + self.cx, p[1]*self.fy + self.cy], dtype=np.float64)
+                        p0 = _px(ip0); p1 = _px(ip1); p2 = _px(ip2)
+                        if (np.linalg.norm(p0 - p1) < MIN_PAIR_SEP_PX or
+                            np.linalg.norm(p0 - p2) < MIN_PAIR_SEP_PX or
+                            np.linalg.norm(p1 - p2) < MIN_PAIR_SEP_PX):
+                            continue
+
+                        Ibuf = self._p3p_img; Ibuf[0,:]=ip0; Ibuf[1,:]=ip1; Ibuf[2,:]=ip2
+                        num_trials += 1
+                        retval, rvecs, tvecs = cv2.solveP3P(
+                            Xbuf, Ibuf, self._eye3, None,
+                            flags=cv2.SOLVEPNP_LAMBDA_TWIST if hasattr(cv2, 'SOLVEPNP_LAMBDA_TWIST') else cv2.SOLVEPNP_P3P,
+                        )
+                        if not retval:
+                            continue
+                        for idx in range(len(rvecs)):
+                            rvec = rvecs[idx].reshape(3)
+                            tvec = tvecs[idx].reshape(3)
+                            R, _ = cv2.Rodrigues(rvec)
+                            if not (self.z_min <= tvec[2] <= self.z_max):
+                                continue
+                            if use_gravity:
+                                q = quat_from_R(R)
+                                swing, _tw = self._quat_decompose_swing_twist(q, gravity_vec)
+                                ang_pose = 2.0 * math.acos(max(-1.0, min(1.0, swing[3])))
+                                ang_prior = 2.0 * math.acos(max(-1.0, min(1.0, swing_prior[3])))
+                                if abs(ang_pose - ang_prior) > gravity_tolerance_rad:
+                                    continue
+                            ok3 = True
+                            for (Xw, dirw, ip) in ((led0.pos, d0, ip0), (led1.pos, d1, ip1), (led2.pos, d2, ip2)):
+                                cam_p = (R @ Xw) + tvec
+                                if cam_p[2] <= 0.0:
+                                    ok3 = False; break
+                                view_dir = cam_p / (np.linalg.norm(cam_p) + 1e-12)
+                                cam_dir = R @ dirw[:3]; cam_dir /= (np.linalg.norm(cam_dir) + 1e-12)
+                                if float(np.dot(view_dir, cam_dir)) > 0.0:
+                                    ok3 = False; break
+                                proj = cam_p / cam_p[2]
+                                if float(np.linalg.norm(proj[:2] - ip)) > self.backcheck_tol_norm:
+                                    ok3 = False; break
+                            if not ok3:
+                                continue
+                            cam_p4 = (R @ xcheck) + tvec
+                            if cam_p4[2] <= 0.0:
+                                continue
+                            proj4 = cam_p4 / cam_p4[2]
+                            if float(np.linalg.norm(proj4[:2] - ip3)) > self._points[neigh[k]].max_dist:
+                                continue
+
+                            #collect greedy 1-1 gated matches (pixel domain) from this seed
+                            P = R @ self._led_pos_T + tvec.reshape(3,1)
+                            zpos = P[2,:] > 0.0
+                            dirs_cam = R @ self._led_dir_T
+                            view_dirs = P / (np.linalg.norm(P, axis=0, keepdims=True) + 1e-12)
+                            facing = (np.sum(dirs_cam * view_dirs, axis=0) < 0.05)  #allow slight grazing
+                            vis = zpos & facing
+                            if not np.any(vis):
+                                continue
+
+                            Pv = P[:, vis]
+                            proj_norm = Pv[:2,:] / Pv[2:3,:]
+                            proj_px = (self.K[:2,:2] @ proj_norm) + self.K[:2,2:3]
+                            proj_px = proj_px.T  #(Nv,2)
+
+                            blob_xy = np.ascontiguousarray([[b.x, b.y] for b in self._blobs], dtype=np.float64)
+                            scale = self.gate_px_scale * (self.fx + self.fy)
+
+                            obj_pts = []
+                            img_pts = []
+                            used_blob = np.zeros(len(self._blobs), dtype=np.bool_)
+                            vis_idx = np.nonzero(vis)[0]
+                            for ii, led_idx in enumerate(vis_idx):
+                                p = proj_px[ii]
+                                dxy = blob_xy - p
+                                d2 = np.einsum('ij,ij->i', dxy, dxy)
+                                bidx = int(np.argmin(d2))
+                                if used_blob[bidx]:
+                                    continue
+                                gate_px = float(self._points[bidx].max_dist) * scale
+                                if math.sqrt(float(d2[bidx])) <= gate_px:
+                                    used_blob[bidx] = True
+                                    obj_pts.append(self.leds[led_idx].pos.astype(np.float64))
+                                    img_pts.append(p.astype(np.float64))
+
+                            if len(obj_pts) >= 6:
+                                obj = np.asarray(obj_pts, np.float64).reshape(-1,1,3)
+                                img = np.asarray(img_pts, np.float64).reshape(-1,1,2)
+                                try:
+                                    rvec_ref, _ = cv2.Rodrigues(R)
+                                    rvec_ref = rvec_ref.reshape(3,1)
+                                    tvec_ref = tvec.reshape(3,1)
+                                    rvec_ref, tvec_ref = cv2.solvePnPRefineLM(obj, img, self.K, self.dist, rvec_ref, tvec_ref)
+                                    R, _ = cv2.Rodrigues(rvec_ref)
+                                    tvec = tvec_ref.reshape(3)
+                                except Exception:
+                                    #if refine is unavailable, just keep the seed
+                                    pass
+
+                            #full evaluation and bookkeeping
+                            num_pose_checks += 1
+                            metrics = self._evaluate_pose(R, tvec, use_pose_prior, pose_prior, pos_error_thresh, rot_error_thresh)
+                            if self._is_better_pose(best_metrics, metrics):
+                                best_metrics = metrics; best_R = R; best_t = tvec; best_blob_depth = 1
+                                improved_any = True
+        return improved_any, {
+            'metrics': best_metrics,
+            'R': best_R,
+            't': best_t,
+            'num_trials': num_trials,
+            'num_pose_checks': num_pose_checks,
+            'blob_depth': best_blob_depth,
+            'led_depth': None,
         }
 
-        #adaptive search depths based on distance
-        if self.adaptive_search:
-            if expected_distance is not None:
-                if expected_distance > 1500:  #far
-                    depth_schedules = [(2, 2), (3, 3)]
-                elif expected_distance > 800:  #medium
-                    depth_schedules = [(3, 3), (4, 4)]
-                else:  #close
-                    depth_schedules = [(3, 3), (4, 4), (5, 5)]
-            else:
-                #default adaptive schedule
-                depth_schedules = [(2, 2), (3, 3), (4, 4)] if self.shallow_search else [(3, 3), (4, 5), (6, 6)]
-        else:
-            #fixed depths
-            max_led_depth = 4 if self.shallow_search else self.max_led_depth
-            max_blob_depth = 4 if self.shallow_search else self.max_blob_depth
-            depth_schedules = [(max_led_depth, max_blob_depth)]
+    def _evaluate_pose(
+        self,
+        R: np.ndarray,
+        t: np.ndarray,
+        use_pose_prior: bool,
+        pose_prior: Optional[Tuple[np.ndarray, np.ndarray]],
+        pos_err_thresh: Optional[np.ndarray],
+        rot_err_thresh: Optional[np.ndarray],
+    ) -> PoseMetrics:
+        if use_pose_prior and pose_prior is not None and (pos_err_thresh is not None or rot_err_thresh is not None):
+            R0, t0 = self._parse_pose_prior(pose_prior)
+            if pos_err_thresh is not None:
+                if np.any(np.abs(t - t0) > pos_err_thresh.reshape(-1)):
+                    return PoseMetrics()
+            if rot_err_thresh is not None:
+                dR = R0.T @ R
+                angle = math.acos(max(-1.0, min(1.0, (np.trace(dR) - 1.0) * 0.5)))
+                if angle > float(rot_err_thresh.reshape(-1)[0]):
+                    return PoseMetrics()
+        #preallocate projection buffer
+        N = self.N_leds
+        if self._proj_buf is None or self._proj_buf.shape != (3, N):
+            self._proj_buf = np.empty((3, N), np.float64)
+        P = self._proj_buf
+        # P = R*X + t
+        P[...] = R @ self._led_pos_T
+        P += t.reshape(3, 1)
+        vis = P[2, :] > 0.0
+        if not np.any(vis):
+            return PoseMetrics()
+        dirs_cam = R @ self._led_dir_T
+        view_dirs = P / (np.linalg.norm(P, axis=0, keepdims=True) + 1e-12)
+        facing = (np.sum(dirs_cam * view_dirs, axis=0) < 0.05) 
+        vis = vis & facing
+        if not np.any(vis):
+            return PoseMetrics()
+        Pv = P[:, vis]
+        xnorm = Pv[:2, :] / Pv[2:3, :]
+        xp = (self.K[:2, :2] @ xnorm) + self.K[:2, 2:3]
+        xp = xp.T  # (Nvis,2)
+        blob_xy = np.ascontiguousarray([[b.x, b.y] for b in self._blobs], dtype=np.float64)
 
-        #search with increasing complexity
-        for led_depth, blob_depth in depth_schedules:
-            found_good = self._search_with_depths(
-                led_depth, blob_depth, centers_px, radii, 
-                blob_neighbors, best, expected_distance
-            )
-            
-            if found_good and self.stop_on_strong:
-                #check if we should stop based on distance
-                if expected_distance is not None and expected_distance > 1000:
-                    if best["inliers"] >= 5 and best["reproj_rmse"] < 3.0:
-                        break
-                else:
-                    if best["inliers"] >= self.strong_min_inliers and best["reproj_rmse"] <= self.strong_px_err_per_inlier:
-                        break
-            
-            #general early termination
-            if best["inliers"] >= 6 and best["reproj_rmse"] < 2.0:
-                break
+        #global cheapest-first 1-to-1 matching within per-blob gates
+        pairs: List[Tuple[float,int,int]] = []
+        scale = self.gate_px_scale * (self.fx + self.fy)
+        for i in range(xp.shape[0]):
+            dxy = blob_xy - xp[i]
+            d2  = np.einsum('ij,ij->i', dxy, dxy)
+            for bi, dd in enumerate(d2):
+                gate_px = float(self._points[bi].max_dist) * scale
+                if dd <= (gate_px * gate_px):  #squared compare
+                    pairs.append((float(dd), i, bi))
 
-        #update temporal tracking
-        if best["rvec"] is not None and best["tvec"] is not None:
-            self._last_rvec = best["rvec"].copy()
-            self._last_tvec = best["tvec"].copy()
-            self._last_distance = np.linalg.norm(best["tvec"])
-            self._last_inlier_count = best["inliers"]
-        
-        self.stats['solve_time'] = time.time() - start_time
-        
-        #prepare result
-        ok = best["inliers"] >= 4 and np.isfinite(best["reproj_rmse"])
-        
-        result_score = best.copy()
-        result_score.update(self.stats)
-        if expected_distance is not None:
-            result_score["expected_distance"] = expected_distance
-            if best["tvec"] is not None:
-                result_score["actual_distance"] = np.linalg.norm(best["tvec"])
-        
-        return ok, best["rvec"], best["tvec"], result_score
+        pairs.sort(key=lambda t_: t_[0])
+        used_blob = np.zeros(len(self._blobs), dtype=np.bool_)
+        used_led  = np.zeros(xp.shape[0], dtype=np.bool_)
+        err_sum = 0.0; matched = 0
+        for dd, li, bi in pairs:
+            if used_led[li] or used_blob[bi]:
+                continue
+            used_led[li] = True
+            used_blob[bi] = True
+            err_sum += dd
+            matched += 1
+
+        metrics = PoseMetrics()
+        metrics.visible_leds = int(xp.shape[0])
+        metrics.matched_blobs = int(matched)
+        metrics.unmatched_blobs = int(len(self._blobs) - matched)
+        metrics.reprojection_error = float(err_sum)
+        if matched >= 4:
+            metrics.match_flags |= POSE_MATCH_GOOD
+        if matched >= self.strong_min_inliers:
+            rmse = math.sqrt(err_sum / max(matched, 1))
+            if rmse <= self.strong_max_rmse_px:
+                metrics.match_flags |= POSE_MATCH_STRONG
+        return metrics
+
+    @staticmethod
+    def _is_better_pose(best: Optional[PoseMetrics], cand: Optional[PoseMetrics]) -> bool:
+        if cand is None:
+            return False
+        if best is None:
+            return True
+        if cand.matched_blobs != best.matched_blobs:
+            return cand.matched_blobs > best.matched_blobs
+        if cand.reprojection_error != best.reprojection_error:
+            return cand.reprojection_error < best.reprojection_error
+        return cand.visible_leds > best.visible_leds
+
+    def warmup(self):
+        """Run a quick, no-op path to JIT-compile numba functions early."""
+        if NUMBA_AVAILABLE:
+            _ = _sorted_sqdist_indices(np.zeros((3,2), np.float64))
+
+
+def make_search(K: np.ndarray, dist: np.ndarray, model_points: np.ndarray, model_normals: np.ndarray, model_id: int = 0) -> CorrespondenceSearch:
+    return CorrespondenceSearch(K, dist, model_points, model_normals, model_id=model_id)
+
+if __name__ == '__main__':
+    K = np.array([[800.0, 0.0, 640.0], [0.0, 800.0, 360.0], [0.0, 0.0, 1.0]], dtype=np.float64)
+    dist = np.zeros(5)
+    pts = np.array([[-0.05,-0.05,0],[0.05,-0.05,0],[0.05,0.05,0],[-0.05,0.05,0],[0.0,0.0,0]], dtype=np.float64)
+    nrms = np.tile(np.array([0,0,-1.0], dtype=np.float64), (pts.shape[0],1))
+    cs = CorrespondenceSearch(K, dist, pts, nrms)
+    #project a synthetic pose
+    R, _ = cv2.Rodrigues(np.array([0.05,-0.02,0.01]))
+    t = np.array([0.0,0.0,1.0])
+    P = (R @ pts.T + t.reshape(3,1))
+    xnorm = P[:2,:] / P[2:3,:]
+    pix = (K[:2,:2] @ xnorm) + K[:2,2:3]
+    pix = pix.T
+    blobs = [Blob(x=float(pix[i,0]), y=float(pix[i,1]), width=6.0, height=6.0) for i in range(pix.shape[0])]
+    cs.set_blobs(blobs, search_flags=CS_FLAG_MATCH_ALL_BLOBS)
+    ok, res = cs.solve()
+    print('OK:', ok, 'inliers:', res['metrics'].matched_blobs if ok else 0)
